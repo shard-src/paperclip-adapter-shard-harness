@@ -1,0 +1,27 @@
+{
+  "name": "@shard-src/paperclip-adapter-shard-harness",
+  "version": "1.0.0",
+  "description": "Unified Qoder + Z.ai GLM harness override for Paperclip's claude_local adapter — enables per-task model selection across both coding plans",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shard-src/paperclip-adapter-shard-harness.git"
+  },
+  "keywords": ["paperclip", "paperclip-adapter", "qoder", "zai", "glm", "ai-agents"],
+  "exports": {
+    ".": "./index.js",
+    "./server": "./server/index.js",
+    "./ui": "./ui/index.js",
+    "./ui-parser": "./ui-parser.cjs"
+  },
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
+  "dependencies": {
+    "@paperclipai/adapter-claude-local": "2026.1106.0"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  }
+}
