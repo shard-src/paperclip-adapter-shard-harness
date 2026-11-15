@@ -47,6 +47,17 @@ paperclipai adapter install --payload-json \
 
 Restart the Paperclip service if the CLI reports `requiresRestart`.
 
+The adapter module supports hot reload without a server restart:
+`POST /api/adapters/claude_local/reload` (instance admin). New runs pick up
+the reloaded code; in-flight runs finish on the previously loaded module.
+
+Run results are post-processed (`repairRunDisposition`, MYL-44) so successful
+runs killed by `terminal_result_cleanup` (exit 143) are not recorded as
+failed, `claude_auth_required` is only reported when the login marker appears
+in terminal fields rather than transcript echo, and Z.ai quota / rate-limit
+texts map to `provider_quota` / `claude_transient_upstream`.
+Tests: `node --test test/`.
+
 ## Rollback
 
 Adapters → `claude_local` → pause override (or
