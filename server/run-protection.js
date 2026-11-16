@@ -30,6 +30,12 @@ export const CANCEL_POLL_MS_DEFAULT = 5_000;
 export const CANCEL_KILL_GRACE_MS_DEFAULT = 10_000;
 export const THINKING_WINDOW_MS_DEFAULT = 15_000;
 
+// README-documented env override for the thinking_tokens tap window.
+function thinkingWindowMs() {
+  const raw = Number(process.env.SHARD_HARNESS_THINKING_WINDOW_MS);
+  return Number.isFinite(raw) && raw >= 100 ? raw : THINKING_WINDOW_MS_DEFAULT;
+}
+
 // ── thinking_tokens tap ───────────────────────────────────────────────────────
 
 function isThinkingTokensLine(line) {
@@ -249,7 +255,7 @@ export function startCancelWatchdog({
 export function protectExecute(claudeExecute, repair) {
   return (ctx) => {
     const baseOnLog = ctx.onLog ?? (() => { });
-    const tap = createThinkingTap(baseOnLog);
+    const tap = createThinkingTap(baseOnLog, { windowMs: thinkingWindowMs() });
     const watchdog = ctx.runId
       ? startCancelWatchdog({ runId: ctx.runId, onLog: tap.onLog })
       : null;
