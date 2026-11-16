@@ -5,6 +5,7 @@ import {
   listClaudeSkills,
   syncClaudeSkills,
 } from "@paperclipai/adapter-claude-local/server";
+import { protectExecute } from "./run-protection.js";
 
 const ZAI_BASE_URL = "https://api.z.ai/api/anthropic";
 
@@ -324,7 +325,7 @@ export function createServerAdapter() {
     type,
     label,
     runtimeToolDelivery: "native_mcp",
-    execute: (ctx) => claudeExecute(withDefaults(ctx)).then(repairRunDisposition),
+    execute: protectExecute((ctx) => claudeExecute(withDefaults(ctx)), repairRunDisposition),
     testEnvironment,
     models,
     listModels: async () => models,

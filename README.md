@@ -26,6 +26,29 @@ uninstalled); a leftover `harness: "qoder"` value falls back to plain
 Claude Code. Companion standalone adapter:
 [@shard-src/paperclip-adapter-zai](https://github.com/shard-src/paperclip-adapter-zai).
 
+## Run protection (v1.3.0)
+
+Two wrapper-level guards around the vendored upstream `claudeExecute`
+(adapter-claude-local 2026.1106.0), both in [`server/run-protection.js`](server/run-protection.js):
+
+- **Cancel watchdog.** Upstream marks an operator-cancelled run `cancelled` in
+  the DB but never kills the CLI process (policy `preserve_without_replay_v1`
+  for legacy executions): the process keeps streaming — burning provider-plan
+  tokens — and holds the agent slot, so queued comments and accepted retries do
+  not dispatch until the process exits on its own. The watchdog polls the run
+  row over the embedded Postgres and kills the recorded process group itself:
+  `SIGTERM`, then `SIGKILL` after a 10 s grace. Disabled automatically (no
+  side effects) when the instance layout or database is unreachable.
+- **thinking_tokens log tap.** The CLI emits one
+  `{"type":"system","subtype":"thinking_tokens",...}` event per streaming
+  delta — ~5 events per thinking token, 91–95 % of stored run-log bytes. The
+  tap forwards at most one event per 15 s window (the latest estimate), keeping
+  run logs readable while preserving the recent-output liveness signal.
+  Override the window with `SHARD_HARNESS_THINKING_WINDOW_MS`.
+
+Both are best-effort: any internal failure disables the guard without
+affecting the run.
+
 ## Requirements
 
 - Paperclip self-hosted instance (Node.js >= 24.11)
