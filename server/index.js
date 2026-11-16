@@ -52,9 +52,10 @@ const ZAI_IDS = new Set(ZAI_MODELS.map((m) => m.id));
 // problems on — and is dropped only when it matched transcript echo in stdout.
 
 // Verbatim from claude-local dist/server/parse.js @ 2026.1106.0 (the
-// dependency is exact-pinned in package.json; re-diff these when bumping).
-const CLAUDE_LOGIN_PROMPT_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
-const CLAUDE_AUTH_TOKEN_FAILURE_RE = /(?:authentication[_\s-](?:failed|error)|failed\s+to\s+authenticate|invalid\s+bearer\s+token|(?:invalid|expired|revoked)[\s\S]{0,40}(?:bearer|oauth|access)\s+token|(?:bearer|oauth|access)\s+token[\s\S]{0,40}(?:is\s+)?(?:invalid|expired|revoked))/i;
+// dependency is exact-pinned in package.json; re-diff these when bumping —
+// test/upstream-drift.test.mjs fails loudly when they drift).
+export const CLAUDE_LOGIN_PROMPT_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
+export const CLAUDE_AUTH_TOKEN_FAILURE_RE = /(?:authentication[_\s-](?:failed|error)|failed\s+to\s+authenticate|invalid\s+bearer\s+token|(?:invalid|expired|revoked)[\s\S]{0,40}(?:bearer|oauth|access)\s+token|(?:bearer|oauth|access)\s+token[\s\S]{0,40}(?:is\s+)?(?:invalid|expired|revoked))/i;
 
 // Z.ai (GLM coding plan) failure texts upstream claude-local does not know.
 const ZAI_PROVIDER_QUOTA_RE = /credit\s+usage\s+limit|you(?:'|’)ve\s+reached\s+your\s+credit/i;
