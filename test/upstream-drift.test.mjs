@@ -30,14 +30,16 @@ const VENDORED_PARSE = path.join(
 
 function vendoredRegex(name) {
   const text = readFileSync(VENDORED_PARSE, "utf8");
-  const match = text.match(new RegExp(`const ${name} = /(.*)/([a-z]*);\\n`, "s"));
-  if (!match) {
+  // The declarations are single-line: const NAME = /.../flags;
+  const line = text.match(new RegExp(`^const ${name} = (/.*/[a-z]*);$`, "m"));
+  if (!line) {
     throw new Error(
       `${name} not found in vendored parse.js — the upstream layout changed; ` +
       "re-diff the copied regexes in server/index.js and update this test's extractor.",
     );
   }
-  return { source: match[1], flags: match[2] };
+  const literal = line[1].match(/^\/(.*)\/([a-z]*)$/);
+  return { source: literal[1], flags: literal[2] };
 }
 
 describe("upstream drift guard (claude-local 2026.1106.0)", () => {
