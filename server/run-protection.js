@@ -67,6 +67,11 @@ function isThinkingTokensLine(line) {
 // reassembled stdout line before tap filtering — the progress reporter hooks
 // in here, sharing the same line reassembly. Returns the wrapped onLog plus a
 // dispose() that flushes any pending state.
+//
+// Every re-emitted stdout chunk keeps its trailing "\n": the Paperclip UI
+// reassembles transcript lines by splitting chunk text on newlines, so a
+// newline-less chunk stream glues lines together and the run transcript
+// renders empty (MYL-55).
 export function createThinkingTap(onLog, { now = Date.now, windowMs = THINKING_WINDOW_MS_DEFAULT, onLine = null } = {}) {
   let carry = ""; // partial line across chunk boundaries
   let pending = null; // latest thinking_tokens line held for the window
@@ -74,9 +79,9 @@ export function createThinkingTap(onLog, { now = Date.now, windowMs = THINKING_W
   let flushTimer = null;
   let disposed = false;
 
-  const forward = (chunk) => {
+  const forward = (line) => {
     try {
-      onLog("stdout", chunk);
+      onLog("stdout", `${line}\n`);
     } catch { /* logging must never break a run */ }
   };
 
@@ -131,12 +136,18 @@ export function createThinkingTap(onLog, { now = Date.now, windowMs = THINKING_W
   return {
     onLog: tappedOnLog,
     dispose() {
+      // A trailing partial line still matters (final result event when the
+      // CLI dies without a newline): flush it through the normal path.
+      if (carry) {
+        const line = carry;
+        carry = "";
+        handleLine(line);
+      }
       disposed = true;
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = null;
       // Best-effort final flush so the last estimate is not lost.
       flushPending();
-      carry = "";
     },
   };
 }
