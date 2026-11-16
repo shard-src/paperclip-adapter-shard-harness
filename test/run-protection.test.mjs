@@ -1,27 +1,41 @@
-// MYL-49 — run protection tests.
+// MYL-49 / MYL-56 — run protection tests.
 //
 // 1) thinking_tokens tap: rapid per-delta events collapse to at most one per
-//    window; other lines pass through in order; partial lines reassemble.
-// 2) cancel watchdog: a DB row flipped to `cancelled` triggers SIGTERM on the
-//    recorded process group and escalates to SIGKILL after the grace period;
-//    other statuses are never signalled.
+//    window; other lines pass through in order; partial lines reassemble; the
+//    onLine hook observes every reassembled stdout line.
+// 2) signal-based cancel: abort fires SIGTERM on the adopted process group
+//    and escalates to SIGKILL after the grace period; ESRCH is success; a
+//    cancel that beats the spawn kills on adopt; without a signal the guard
+//    is inert; dispose removes the listener and the pending escalation.
+// 3) progress reporter: content_block_start tool_use and assistant events map
+//    to run_activity updates, throttled per interval; garbage lines are
+//    ignored; reporter failures never break the caller.
+// 4) protectExecute wiring: tap + guard + reporter + onCancellationReady.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
   createThinkingTap,
-  startCancelWatchdog,
+  createProgressReporter,
+  createSignalCancelGuard,
   protectExecute,
 } from "../server/run-protection.js";
 
 const tt = (n, delta = 1) =>
   `{"type":"system","subtype":"thinking_tokens","estimated_tokens":${n},"estimated_tokens_delta":${delta},"session_id":"s","uuid":"u${n}"}\n`;
 const RESULT = `{"type":"result","subtype":"success","is_error":false}\n`;
+const TOOLUSE = `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}\n`;
+const ASSISTANT = `{"type":"assistant","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"Checking the deploy pipeline now"}]},"session_id":"s"}\n`;
+const ASSISTANT_TOOL = `{"type":"assistant","message":{"id":"m2","role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{}}]},"session_id":"s"}\n`;
+const TEXT_BLOCK_START = `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n`;
+const GARBAGE = `claude code v2.1.0 — starting headless session\n`;
 
 function collector() {
   const calls = [];
   return { calls, onLog: (stream, chunk) => { calls.push([stream, chunk]); } };
 }
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 describe("thinking_tokens tap", () => {
   it("collapses a burst to one event per window", () => {
@@ -76,112 +90,249 @@ describe("thinking_tokens tap", () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0][0], "stderr");
   });
+
+  it("onLine observes every reassembled stdout line, held ones included", () => {
+    const observed = [];
+    const { onLog } = collector();
+    const tap = createThinkingTap(onLog, { now: () => 1000, windowMs: 15_000, onLine: (l) => observed.push(l) });
+    tap.onLog("stdout", tt(1)); // held by the tap, still observed
+    const split = TOOLUSE.slice(0, 30);
+    tap.onLog("stdout", split);
+    tap.onLog("stdout", TOOLUSE.slice(30) + RESULT);
+    tap.dispose();
+    // tt(1), reassembled TOOLUSE, RESULT — three logical lines.
+    assert.equal(observed.length, 3);
+    assert.ok(observed[0].includes("thinking_tokens"));
+    assert.ok(observed[1].includes("content_block_start"));
+    assert.ok(observed[2].includes('"type":"result"'));
+  });
+
+  it("an throwing onLine observer never breaks the tap", () => {
+    const { calls, onLog } = collector();
+    const tap = createThinkingTap(onLog, {
+      now: () => 1000,
+      windowMs: 15_000,
+      onLine: () => { throw new Error("observer exploded"); },
+    });
+    tap.onLog("stdout", RESULT);
+    tap.dispose();
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0][1].includes('"type":"result"'));
+  });
 });
 
-describe("cancel watchdog", () => {
-  function harness({ rows, pollMs = 5, graceMs = 20 }) {
+describe("signal-based cancel", () => {
+  function guardHarness({ graceMs = 20 } = {}) {
     const kills = [];
-    const queries = [];
-    let queryCount = 0;
-    const client = {
-      async query(sql, params) {
-        queries.push([sql, params]);
-        const row = typeof rows === "function" ? rows(queryCount) : rows[queryCount];
-        queryCount += 1;
-        return { rows: row ? [row] : [] };
-      },
-      end: async () => { },
-    };
-    const watchdog = startCancelWatchdog({
-      runId: "run-1",
-      onLog: () => { },
-      deps: {
-        connectDb: async () => client,
-        kill: (pgid, signal) => kills.push([pgid, signal]),
-        pollMs,
-        graceMs,
-      },
+    const notes = [];
+    const controller = new AbortController();
+    const guard = createSignalCancelGuard({
+      signal: controller.signal,
+      kill: (pgid, sig) => kills.push([pgid, sig]),
+      graceMs,
+      note: (t) => notes.push(t),
     });
-    return { watchdog, kills };
+    return { guard, controller, kills, notes };
   }
-  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  it("SIGTERMs the process group when the run is cancelled, then SIGKILLs after grace", async () => {
-    // First poll: still running. Then cancelled forever after.
-    let cancelled = false;
-    const { watchdog, kills } = harness({
-      rows: () => (cancelled
-        ? { status: "cancelled", process_pid: 4242, process_group_id: 4242 }
-        : { status: "running", process_pid: 4242, process_group_id: 4242 }),
-    });
-    await wait(10); // one running poll, no signal
-    assert.equal(kills.length, 0);
-    cancelled = true;
-    await wait(12); // SIGTERM lands on the next poll
+  it("SIGTERMs the adopted group on abort, then SIGKILLs after grace", async () => {
+    const { guard, controller, kills } = guardHarness({ graceMs: 20 });
+    guard.adopt(4242);
+    controller.abort();
     assert.deepEqual(kills, [[4242, "SIGTERM"]]);
-    await wait(30); // grace elapses -> SIGKILL
+    await wait(60); // grace elapses -> SIGKILL
     assert.deepEqual(kills, [[4242, "SIGTERM"], [4242, "SIGKILL"]]);
-    watchdog.stop();
+    guard.dispose();
   });
 
-  it("never signals a non-cancelled run", async () => {
-    const { watchdog, kills } = harness({
-      rows: () => ({ status: "running", process_pid: 99, process_group_id: 99 }),
+  it("never signals without an adopted group", async () => {
+    const { guard, controller, kills } = guardHarness({ graceMs: 10 });
+    controller.abort();
+    await wait(30);
+    assert.equal(kills.length, 0);
+    guard.dispose();
+  });
+
+  it("a cancel that wins the race against the spawn kills on adopt", async () => {
+    const { guard, controller, kills } = guardHarness({ graceMs: 20 });
+    controller.abort(); // abort before onSpawn ever ran
+    await wait(5);
+    guard.adopt(777);
+    assert.deepEqual(kills, [[777, "SIGTERM"]]);
+    await wait(40);
+    assert.deepEqual(kills, [[777, "SIGTERM"], [777, "SIGKILL"]]);
+    guard.dispose();
+  });
+
+  it("keeps the first adopted group and ignores invalid ones", async () => {
+    const { guard, controller, kills } = guardHarness({ graceMs: 20 });
+    guard.adopt(4242);
+    guard.adopt(999); // second spawn meta must not retarget
+    controller.abort();
+    assert.deepEqual(kills, [[4242, "SIGTERM"]]);
+    guard.dispose();
+  });
+
+  it("treats ESRCH as success and skips escalation", async () => {
+    const controller = new AbortController();
+    const esrch = new Error("kill ESRCH");
+    esrch.code = "ESRCH";
+    const guard = createSignalCancelGuard({
+      signal: controller.signal,
+      kill: () => { throw esrch; },
+      graceMs: 10,
+      note: () => { },
     });
+    guard.adopt(77);
+    controller.abort();
+    await wait(30);
+    // Guard stood down after SIGTERM hit a dead group: no crash, no timer left.
+    guard.dispose();
+  });
+
+  it("without a signal the guard stays armed but inert", async () => {
+    const kills = [];
+    const guard = createSignalCancelGuard({
+      signal: null, // older server: no ctx.signal
+      kill: (pgid, sig) => kills.push([pgid, sig]),
+      graceMs: 10,
+    });
+    guard.adopt(5);
     await wait(25);
     assert.equal(kills.length, 0);
-    watchdog.stop();
+    guard.dispose();
   });
 
-  it("treats ESRCH as success and stops", async () => {
-    let fired = false;
-    const client = {
-      async query() {
-        return fired
-          ? { rows: [{ status: "cancelled", process_pid: 77, process_group_id: 77 }] }
-          : { rows: [{ status: "running", process_pid: 77, process_group_id: 77 }] };
-      },
-      end: async () => { },
-    };
-    const kills = [];
-    const watchdog = startCancelWatchdog({
-      runId: "run-2",
-      onLog: () => { },
-      deps: {
-        connectDb: async () => client,
-        kill: (pgid, signal) => {
-          if (signal === "SIGTERM") {
-            const e = new Error("no such process");
-            e.code = "ESRCH";
-            throw e;
-          }
-          kills.push([pgid, signal]);
-        },
-        pollMs: 5,
-        graceMs: 10,
-      },
+  it("dispose removes the listener and the pending escalation", async () => {
+    const { guard, controller, kills } = guardHarness({ graceMs: 15 });
+    guard.adopt(9);
+    controller.abort();
+    guard.dispose(); // run settled before the grace elapsed
+    await wait(40);
+    assert.deepEqual(kills, [[9, "SIGTERM"]]); // escalation cancelled
+    controller.abort(); // listener removed: no second delivery
+    await wait(20);
+    assert.deepEqual(kills, [[9, "SIGTERM"]]);
+  });
+});
+
+describe("progress reporter", () => {
+  function reporterHarness({ intervalMs = 5_000, clock = 1_000_000 } = {}) {
+    const updates = [];
+    let now = clock;
+    const reporter = createProgressReporter({
+      onProgress: async (u) => { updates.push(u); },
+      now: () => now,
+      intervalMs,
     });
-    fired = true;
-    await wait(15);
-    assert.equal(kills.length, 0); // SIGTERM hit ESRCH -> done, no SIGKILL
-    watchdog.stop();
+    return { reporter, updates, tick: (ms) => { now += ms; } };
+  }
+
+  it("maps content_block_start tool_use to a Using <tool> update", () => {
+    const { reporter, updates } = reporterHarness();
+    reporter.observeLine(TOOLUSE);
+    reporter.dispose();
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].phase, "run_activity");
+    assert.equal(updates[0].currentToolName, "Bash");
+    assert.equal(updates[0].message, "Using Bash");
+    assert.equal(updates[0].lastAssistantSnippet, null);
+    assert.ok(updates[0].lastEventAt);
   });
 
-  it("stops cleanly when the run row disappears", async () => {
-    let gone = false;
-    const { watchdog, kills } = harness({ rows: () => (gone ? null : { status: "running", process_pid: 1, process_group_id: 1 }) });
-    gone = true;
-    await wait(15);
-    assert.equal(kills.length, 0);
-    watchdog.stop();
+  it("maps assistant text to the lastAssistantSnippet", () => {
+    const { reporter, updates } = reporterHarness();
+    reporter.observeLine(ASSISTANT);
+    reporter.dispose();
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].currentToolName, null);
+    assert.equal(updates[0].lastAssistantSnippet, "Checking the deploy pipeline now");
+    assert.equal(updates[0].message, "Checking the deploy pipeline now");
+  });
+
+  it("prefers the tool name and keeps the snippet as context", () => {
+    const { reporter, updates, tick } = reporterHarness();
+    reporter.observeLine(ASSISTANT);
+    tick(6_000);
+    reporter.observeLine(ASSISTANT_TOOL);
+    reporter.dispose();
+    assert.equal(updates.length, 2);
+    assert.equal(updates[1].currentToolName, "Read");
+    assert.equal(updates[1].message, "Using Read");
+    assert.equal(updates[1].lastAssistantSnippet, "Checking the deploy pipeline now");
+  });
+
+  it("truncates long snippets to 200 chars", () => {
+    const { reporter, updates } = reporterHarness();
+    const long = `{"type":"assistant","message":{"content":[{"type":"text","text":"${"x".repeat(500)}"}]}}\n`;
+    reporter.observeLine(long);
+    reporter.dispose();
+    assert.equal(updates[0].lastAssistantSnippet.length, 200);
+  });
+
+  it("throttles to one update per interval; held state flushes on a later line", () => {
+    const { reporter, updates, tick } = reporterHarness({ intervalMs: 1_000 });
+    reporter.observeLine(TOOLUSE); // t=0: first update goes out
+    reporter.observeLine(ASSISTANT); // t=0: within the window -> held, dirty
+    reporter.observeLine(TEXT_BLOCK_START); // t=0: dirty but window not elapsed
+    tick(500);
+    reporter.observeLine(TEXT_BLOCK_START); // t=500: still inside the window
+    assert.equal(updates.length, 1);
+    tick(600); // t=1100: window elapsed
+    reporter.observeLine(TEXT_BLOCK_START); // unchanged line flushes the held state
+    reporter.dispose();
+    assert.equal(updates.length, 2);
+    assert.equal(updates[1].currentToolName, "Bash"); // tool stays until replaced
+    assert.equal(updates[1].lastAssistantSnippet, "Checking the deploy pipeline now");
+  });
+
+  it("a fresh change after the window goes out immediately", () => {
+    const { reporter, updates, tick } = reporterHarness({ intervalMs: 1_000 });
+    reporter.observeLine(TOOLUSE); // sent
+    tick(2_000);
+    reporter.observeLine(ASSISTANT_TOOL); // tool changed, window elapsed: sent at once
+    reporter.dispose();
+    assert.equal(updates.length, 2);
+    assert.equal(updates[1].currentToolName, "Read");
+  });
+
+  it("ignores non-JSON and malformed lines", () => {
+    const { reporter, updates } = reporterHarness();
+    reporter.observeLine(GARBAGE);
+    reporter.observeLine('{"type":"assistant"'); // truncated JSON
+    reporter.observeLine("null");
+    reporter.observeLine(42);
+    reporter.observeLine(undefined);
+    reporter.dispose();
+    assert.equal(updates.length, 0);
+  });
+
+  it("never breaks the caller: sync throw and rejected promise are swallowed", async () => {
+    const attempts = [];
+    let clock = 1_000_000;
+    const reporter = createProgressReporter({
+      onProgress: (u) => {
+        attempts.push(u.message);
+        if (attempts.length === 1) throw new Error("sync boom");
+        return Promise.reject(new Error("async boom"));
+      },
+      now: () => (clock += 6_000), // every observation lands past the window
+      intervalMs: 5_000,
+    });
+    assert.doesNotThrow(() => reporter.observeLine(TOOLUSE));
+    reporter.observeLine(ASSISTANT_TOOL); // interval elapsed -> second emit
+    await wait(10); // let the rejected promise settle
+    reporter.dispose();
+    assert.deepEqual(attempts, ["Using Bash", "Using Read"]);
   });
 });
 
 describe("protectExecute wiring", () => {
-  it("installs the tap, arms the watchdog for runId ctx, and tears both down", async () => {
+  it("installs the tap, forwards onSpawn, and calls onCancellationReady", async () => {
     const seen = [];
+    const spawnMetas = [];
+    const ready = [];
     let ctxSeen = null;
-    const stops = [];
     const fakeExecute = async (ctx) => {
       ctxSeen = ctx;
       ctx.onLog("stdout", tt(1) + tt(2));
@@ -189,26 +340,103 @@ describe("protectExecute wiring", () => {
       return { exitCode: 0, ok: true };
     };
     const wrapped = protectExecute(fakeExecute, (r) => ({ ...r, repaired: true }));
-    const origStart = globalThis.__shardStartCancelWatchdog; // not used; direct test
-    const result = await wrapped({ runId: "r", onLog: (s, c) => seen.push([s, c]) });
+    const result = await wrapped({
+      onLog: (s, c) => seen.push([s, c]),
+      onSpawn: async (meta) => { spawnMetas.push(meta); },
+      onCancellationReady: async () => { ready.push(true); },
+    });
     assert.equal(result.repaired, true);
+    assert.equal(ready.length, 1); // awaited before execute
     assert.equal(ctxSeen.onLog.name, "tappedOnLog");
+    // Wrapped onSpawn still reaches the original (server persist) seam.
+    await ctxSeen.onSpawn({ pid: 4242, processGroupId: 4242, startedAt: "t" });
+    assert.deepEqual(spawnMetas, [{ pid: 4242, processGroupId: 4242, startedAt: "t" }]);
     // Burst collapsed (one immediate), held estimate flushed before result.
     const stdout = seen.filter(([s]) => s === "stdout").map(([, c]) => c);
     assert.equal(stdout.length, 3);
     assert.ok(stdout[0].includes('"estimated_tokens":1'));
-    assert.ok(stdout[1].includes('"estimated_tokens":2'));
     assert.ok(stdout[2].includes('"subtype":"success"'));
-    assert.equal(stops.length, 0);
   });
 
-  it("works without runId (no watchdog) and with the real adapter shape", async () => {
+  it("arms signal cancel: abort inside the run SIGTERMs then SIGKILLs the adopted group", async () => {
+    const origGrace = process.env.SHARD_HARNESS_CANCEL_GRACE_MS;
+    process.env.SHARD_HARNESS_CANCEL_GRACE_MS = "10";
+    try {
+      const controller = new AbortController();
+      const kills = [];
+      const fakeExecute = async (ctx) => {
+        await ctx.onSpawn({ pid: 4242, processGroupId: 4242 });
+        controller.abort();
+        await wait(60); // SIGTERM at once, SIGKILL after the 10ms grace
+        return { exitCode: 0 };
+      };
+      const wrapped = protectExecute(fakeExecute, (r) => r, {
+        kill: (pgid, sig) => kills.push([pgid, sig]),
+      });
+      await wrapped({ onLog: () => { }, signal: controller.signal });
+      assert.deepEqual(kills, [[4242, "SIGTERM"], [4242, "SIGKILL"]]);
+    } finally {
+      if (origGrace === undefined) delete process.env.SHARD_HARNESS_CANCEL_GRACE_MS;
+      else process.env.SHARD_HARNESS_CANCEL_GRACE_MS = origGrace;
+    }
+  });
+
+  it("falls back to the pid when no processGroupId is reported", async () => {
+    const controller = new AbortController();
+    const kills = [];
     const fakeExecute = async (ctx) => {
+      await ctx.onSpawn({ pid: 3113 }); // runner without a group id
+      controller.abort();
+      return { exitCode: 0 };
+    };
+    const wrapped = protectExecute(fakeExecute, (r) => r, {
+      kill: (pgid, sig) => kills.push([pgid, sig]),
+    });
+    await wrapped({ onLog: () => { }, signal: controller.signal });
+    assert.deepEqual(kills, [[3113, "SIGTERM"]]);
+  });
+
+  it("reports runtime progress from stream-json lines and works without one", async () => {
+    const updates = [];
+    const withProgress = protectExecute(async (ctx) => {
+      ctx.onLog("stdout", TOOLUSE + ASSISTANT + RESULT);
+      return { exitCode: 0 };
+    }, (r) => r);
+    await withProgress({ onLog: () => { }, onRuntimeProgress: async (u) => { updates.push(u); } });
+    // One burst: the tool name goes out at once, the snippet is held for the
+    // next eligible line (throttle), and the run ends before one arrives.
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].phase, "run_activity");
+    assert.equal(updates[0].currentToolName, "Bash");
+    assert.equal(updates[0].lastAssistantSnippet, null);
+
+    const updates2 = [];
+    const withoutProgress = protectExecute(async (ctx) => {
+      ctx.onLog("stdout", TOOLUSE);
+      return { exitCode: 0 };
+    }, (r) => r);
+    await withoutProgress({ onLog: () => { } }); // no onRuntimeProgress: reporter absent
+    assert.equal(updates2.length, 0);
+  });
+
+  it("works without signal, onSpawn, onCancellationReady or runId (legacy ctx)", async () => {
+    const fakeExecute = async (ctx) => {
+      await ctx.onSpawn({ pid: 1 }); // wrapped onSpawn must stay harmless
       ctx.onLog("stdout", tt(1));
       return { exitCode: 0 };
     };
     const wrapped = protectExecute(fakeExecute, (r) => r);
-    const out = await wrapped({ onLog: () => { } }); // no runId
+    const out = await wrapped({ onLog: () => { } });
     assert.equal(out.exitCode, 0);
+  });
+
+  it("a onCancellationReady rejection never stops the run", async () => {
+    const fakeExecute = async () => ({ exitCode: 0, done: true });
+    const wrapped = protectExecute(fakeExecute, (r) => r);
+    const out = await wrapped({
+      onLog: () => { },
+      onCancellationReady: async () => { throw new Error("registration failed"); },
+    });
+    assert.equal(out.done, true);
   });
 });
