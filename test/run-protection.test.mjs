@@ -119,6 +119,47 @@ describe("thinking_tokens tap", () => {
     assert.equal(calls.length, 1);
     assert.ok(calls[0][1].includes('"type":"result"'));
   });
+
+  it("emits newline-terminated stdout chunks so UI line reassembly works (MYL-55)", () => {
+    const { calls, onLog } = collector();
+    const tap = createThinkingTap(onLog, { now: () => 1000, windowMs: 15_000 });
+    tap.onLog("stdout", TOOLUSE + ASSISTANT + RESULT);
+    tap.dispose();
+    const stdout = calls.filter(([s]) => s === "stdout").map(([, c]) => c);
+    assert.ok(stdout.length >= 3);
+    for (const chunk of stdout) {
+      assert.ok(chunk.endsWith("\n"), `chunk must end with newline: ${chunk.slice(0, 60)}`);
+    }
+    // Each chunk is exactly one parseable JSON line.
+    for (const chunk of stdout) {
+      assert.doesNotThrow(() => JSON.parse(chunk));
+    }
+  });
+
+  it("keeps newlines on thinking flushes and split chunks across boundaries", () => {
+    const { calls, onLog } = collector();
+    let clock = 1000;
+    const tap = createThinkingTap(onLog, { now: () => clock, windowMs: 15_000 });
+    tap.onLog("stdout", tt(1).slice(0, 20)); // partial thinking line
+    clock += 100;
+    tap.onLog("stdout", tt(1).slice(20) + RESULT); // completes + a real line
+    tap.dispose();
+    const stdout = calls.filter(([s]) => s === "stdout").map(([, c]) => c);
+    for (const chunk of stdout) {
+      assert.ok(chunk.endsWith("\n"));
+      assert.doesNotThrow(() => JSON.parse(chunk));
+    }
+  });
+
+  it("flushes a trailing partial line on dispose with a newline", () => {
+    const { calls, onLog } = collector();
+    const tap = createThinkingTap(onLog, { now: () => 1000, windowMs: 15_000 });
+    tap.onLog("stdout", RESULT.slice(0, 25)); // no trailing newline yet
+    tap.dispose();
+    const stdout = calls.filter(([s]) => s === "stdout").map(([, c]) => c);
+    assert.equal(stdout.length, 1);
+    assert.equal(stdout[0], RESULT.slice(0, 25) + "\n");
+  });
 });
 
 describe("signal-based cancel", () => {

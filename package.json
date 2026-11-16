@@ -1,6 +1,6 @@
 {
   "name": "@shard-src/paperclip-adapter-shard-harness",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Z.ai GLM harness override for Paperclip's claude_local adapter — per-task model selection, run-disposition repair, signal-based run cancel, runtime progress reporting, thinking-token log tap",
   "type": "module",
   "license": "MIT",
