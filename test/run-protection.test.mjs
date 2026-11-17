@@ -642,4 +642,41 @@ describe("protectExecute stop-receipt wiring (MYL-60)", () => {
     assert.equal(result.resultJson.subtype, "success");
     assert.equal(result.resultJson.executionCancellation, undefined);
   });
+
+  it("a group ignoring SIGTERM still gets its receipt after the SIGKILL escalation (canary follow-up)", async () => {
+    const origGrace = process.env.SHARD_HARNESS_CANCEL_GRACE_MS;
+    process.env.SHARD_HARNESS_CANCEL_GRACE_MS = "30";
+    try {
+      const controller = new AbortController();
+      const kills = [];
+      let groupAlive = true;
+      const kill = (pgid, sig) => {
+        kills.push([pgid, sig]);
+        if (sig === "SIGKILL") groupAlive = false; // only the escalation kills it
+        if (sig === 0 && groupAlive) return;
+        if (sig === 0) {
+          const err = new Error("kill failed: no such process");
+          err.code = "ESRCH";
+          throw err;
+        }
+      };
+      const fakeExecute = async (ctx) => {
+        await ctx.onSpawn({ pid: 555, processGroupId: 555 });
+        controller.abort();
+        return { exitCode: 143, resultJson: { stdout: "x", stderr: "y" } };
+      };
+      const wrapped = protectExecute(fakeExecute, (r) => r, { kill, pollMs: 1, verifyMs: 500 });
+      const result = await wrapped({ onLog: () => { }, signal: controller.signal });
+      assert.equal(result.resultJson.executionCancellation.state, "acknowledged");
+      assert.equal(result.resultJson.executionCancellation.forced, true);
+      // The successful ESRCH probe must follow the SIGKILL escalation: dispose
+      // no longer cancels the escalation before the receipt verifies.
+      const sigs = kills.map(([, s]) => s);
+      assert.ok(sigs.indexOf("SIGKILL") !== -1);
+      assert.ok(sigs.lastIndexOf(0) > sigs.indexOf("SIGKILL"));
+    } finally {
+      if (origGrace === undefined) delete process.env.SHARD_HARNESS_CANCEL_GRACE_MS;
+      else process.env.SHARD_HARNESS_CANCEL_GRACE_MS = origGrace;
+    }
+  });
 });
