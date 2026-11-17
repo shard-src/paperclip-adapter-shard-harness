@@ -25,6 +25,18 @@
 //    lines already flowing through onLog and calls ctx.onRuntimeProgress with
 //    phase "run_activity": the running tool name and the last assistant
 //    snippet, throttled to at most one call per interval.
+// 4) Operator-stop receipt (MYL-60). The server's operator-cancel answer
+//    re-reads the run after the adapter settles and returns 409 "provider
+//    termination could not be verified" unless the terminal row carries
+//    resultJson.executionCancellation.state = "acknowledged" (run-control.js
+//    941-946 on 2026.1106.0). acpx-engine adapters stamp that receipt into
+//    their returned result (adapter-utils acpx-engine/execute.js 3172/4814);
+//    claude_local never implemented the contract, so every fast cancel of an
+//    active legacy run conflicted. After the CLI settles, the wrapper stamps
+//    the receipt — but only when it can honestly verify termination itself:
+//    kill(-pgid, 0) reporting ESRCH (the same OS-level standard as the
+//    server's completedRunTerminationProof local_process_exit), or no process
+//    having been spawned at all. No proof, no stamp: the honest 409 remains.
 //
 // All guards are best-effort: any internal failure disables the guard without
 // affecting the run itself.
@@ -33,6 +45,8 @@ export const CANCEL_KILL_GRACE_MS_DEFAULT = 10_000;
 export const PROGRESS_INTERVAL_MS_DEFAULT = 5_000;
 export const PROGRESS_SNIPPET_MAX_CHARS = 200;
 export const THINKING_WINDOW_MS_DEFAULT = 15_000;
+export const STOP_RECEIPT_VERIFY_MS_DEFAULT = 2_000;
+export const STOP_RECEIPT_POLL_MS_DEFAULT = 25;
 
 // README-documented env override for the thinking_tokens tap window.
 function thinkingWindowMs() {
@@ -54,6 +68,14 @@ function progressIntervalMs() {
   return Number.isFinite(raw) && raw >= PROGRESS_INTERVAL_MS_DEFAULT
     ? raw
     : PROGRESS_INTERVAL_MS_DEFAULT;
+}
+
+// README-documented env override for the operator-stop receipt verification
+// window: how long the wrapper polls the adopted process group for ESRCH
+// before giving up (and leaving the honest 409 in place).
+function stopReceiptVerifyMs() {
+  const raw = Number(process.env.SHARD_HARNESS_STOP_RECEIPT_VERIFY_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : STOP_RECEIPT_VERIFY_MS_DEFAULT;
 }
 
 // ── thinking_tokens tap ───────────────────────────────────────────────────────
@@ -329,6 +351,11 @@ export function createSignalCancelGuard({
       if (pgid == null) pgid = value;
       if (signal?.aborted) killGroup("SIGTERM");
     },
+    // The adopted group (or null): the receipt's verification target.
+    adoptedGroup() {
+      return pgid;
+    },
+    note: safeNote,
     dispose() {
       signal?.removeEventListener("abort", onAbort);
       if (killTimer) {
@@ -339,6 +366,57 @@ export function createSignalCancelGuard({
   };
 }
 
+// ── Operator-stop receipt (MYL-60) ────────────────────────────────────────────
+
+// Probes the adopted process group with signal 0 (existence check, delivers
+// nothing). ESRCH / "no such process" is the OS-level death proof; anything
+// else counts as still alive.
+function probeGroupGone(kill, pgid) {
+  try {
+    kill(pgid, 0);
+    return false;
+  } catch (err) {
+    return isProcessGone(err);
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Builds the adapter-verified stop receipt the server's operator-cancel
+// answer requires (run-control conflict branch passes only when the terminal
+// row carries executionCancellation.state = "acknowledged"; the terminal write
+// spreads the adapter result over the row, run-completion 374-379 on
+// 2026.1106.0). Mirrors the acpx-engine contract:
+//
+// - not aborted → null (a normal run reports nothing);
+// - aborted with no adopted group → acknowledged / forced:false — nothing was
+//   spawned, mirroring acpx "Stopped before provider startup";
+// - aborted with the group verified gone (ESRCH on kill(-pgid, 0), polled for
+//   up to verifyMs) → acknowledged / forced:true;
+// - still alive, or the probe stays inconclusive → null: no honest proof, the
+//   server keeps its verifiable conflict answer.
+export async function operatorStopReceipt({
+  aborted,
+  processGroupId,
+  kill = defaultKill,
+  pollMs = STOP_RECEIPT_POLL_MS_DEFAULT,
+  verifyMs = STOP_RECEIPT_VERIFY_MS_DEFAULT,
+} = {}) {
+  if (!aborted) return null;
+  const acknowledgedAt = new Date().toISOString();
+  if (processGroupId == null) {
+    return { state: "acknowledged", acknowledgedAt, forced: false };
+  }
+  const deadline = Date.now() + Math.max(verifyMs, 0);
+  for (;;) {
+    if (probeGroupGone(kill, processGroupId)) {
+      return { state: "acknowledged", acknowledgedAt, forced: true };
+    }
+    if (Date.now() >= deadline) return null;
+    await sleep(Math.max(pollMs, 1));
+  }
+}
+
 // ── execute() wrapper wiring ─────────────────────────────────────────────────
 
 // Wraps ctx for claudeExecute: installs the thinking tap on onLog (with the
@@ -347,7 +425,11 @@ export function createSignalCancelGuard({
 // ctx.onCancellationReady — the server aborts ctx.signal only for runs whose
 // adapter registered an execution control, so skipping the call would leave
 // the legacy never-kill path in place. All guards are torn down when the run
-// settles. `deps.kill` is a test seam for the cancel escalation.
+// settles. After repair, an aborted run gets the operator-stop receipt
+// (MYL-60) merged into resultJson so the server's cancel answer can verify
+// provider termination instead of conflicting. `deps.kill` is a test seam for
+// the cancel escalation and the receipt probe; `deps.pollMs`/`deps.verifyMs`
+// for the receipt window.
 export function protectExecute(claudeExecute, repair, deps = {}) {
   const { kill = defaultKill } = deps;
   return async (ctx) => {
@@ -391,6 +473,31 @@ export function protectExecute(claudeExecute, repair, deps = {}) {
       reporter?.dispose();
       tap.dispose();
     }
-    return repair(result);
+    result = repair(result);
+
+    // MYL-60: attach the adapter-verified stop receipt. The receipt only
+    // claims what this wrapper proved: no process was spawned, or the adopted
+    // group is gone per the OS. Best-effort like every guard here — a receipt
+    // failure never affects the returned run result.
+    try {
+      const receipt = await operatorStopReceipt({
+        aborted: ctx.signal?.aborted === true,
+        processGroupId: guard.adoptedGroup(),
+        kill,
+        pollMs: deps.pollMs,
+        verifyMs: deps.verifyMs ?? stopReceiptVerifyMs(),
+      });
+      if (receipt && result && typeof result === "object"
+        && (result.resultJson == null || typeof result.resultJson === "object")) {
+        result = {
+          ...result,
+          resultJson: { ...result.resultJson, executionCancellation: receipt },
+        };
+        guard.note(`operator stop receipt: ${receipt.state} (${receipt.forced
+          ? `process group ${guard.adoptedGroup()} exit verified`
+          : "no process spawned"})`);
+      }
+    } catch { /* the receipt is best-effort */ }
+    return result;
   };
 }

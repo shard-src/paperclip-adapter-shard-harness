@@ -18,6 +18,7 @@ import {
   createThinkingTap,
   createProgressReporter,
   createSignalCancelGuard,
+  operatorStopReceipt,
   protectExecute,
 } from "../server/run-protection.js";
 
@@ -413,9 +414,13 @@ describe("protectExecute wiring", () => {
       };
       const wrapped = protectExecute(fakeExecute, (r) => r, {
         kill: (pgid, sig) => kills.push([pgid, sig]),
+        pollMs: 1,
+        verifyMs: 5,
       });
       await wrapped({ onLog: () => { }, signal: controller.signal });
-      assert.deepEqual(kills, [[4242, "SIGTERM"], [4242, "SIGKILL"]]);
+      const sigs = kills.map(([, sig]) => sig);
+      assert.deepEqual(sigs.slice(0, 2), ["SIGTERM", "SIGKILL"]);
+      assert.ok(sigs.slice(2).every((s) => s === 0)); // MYL-60 receipt probes only
     } finally {
       if (origGrace === undefined) delete process.env.SHARD_HARNESS_CANCEL_GRACE_MS;
       else process.env.SHARD_HARNESS_CANCEL_GRACE_MS = origGrace;
@@ -432,9 +437,13 @@ describe("protectExecute wiring", () => {
     };
     const wrapped = protectExecute(fakeExecute, (r) => r, {
       kill: (pgid, sig) => kills.push([pgid, sig]),
+      pollMs: 1,
+      verifyMs: 5,
     });
     await wrapped({ onLog: () => { }, signal: controller.signal });
-    assert.deepEqual(kills, [[3113, "SIGTERM"]]);
+    assert.equal(kills[0][0], 3113);
+    assert.equal(kills[0][1], "SIGTERM");
+    assert.ok(kills.slice(1).every(([pgid, sig]) => pgid === 3113 && sig === 0)); // receipt probes
   });
 
   it("reports runtime progress from stream-json lines and works without one", async () => {
@@ -479,5 +488,158 @@ describe("protectExecute wiring", () => {
       onCancellationReady: async () => { throw new Error("registration failed"); },
     });
     assert.equal(out.done, true);
+  });
+});
+
+describe("operator stop receipt (MYL-60)", () => {
+  const esrch = () => {
+    const err = new Error("kill failed: no such process");
+    err.code = "ESRCH";
+    throw err;
+  };
+
+  it("aborted + group gone (ESRCH on the signal-0 probe) → acknowledged/forced", async () => {
+    const probes = [];
+    const kill = (pgid, sig) => { probes.push([pgid, sig]); esrch(); };
+    const receipt = await operatorStopReceipt({ aborted: true, processGroupId: 4242, kill });
+    assert.equal(receipt.state, "acknowledged");
+    assert.equal(receipt.forced, true);
+    assert.ok(!Number.isNaN(Date.parse(receipt.acknowledgedAt)));
+    assert.deepEqual(probes, [[4242, 0]]); // one probe, no polling needed
+  });
+
+  it("a group dying mid-poll is caught within the window", async () => {
+    let probes = 0;
+    const kill = () => { probes += 1; if (probes >= 3) esrch(); }; // alive twice, then gone
+    const receipt = await operatorStopReceipt({
+      aborted: true, processGroupId: 7, kill, pollMs: 1, verifyMs: 5_000,
+    });
+    assert.equal(receipt?.state, "acknowledged");
+    assert.equal(receipt.forced, true);
+    assert.equal(probes, 3);
+  });
+
+  it("a group still alive after the window → no receipt (the honest conflict stays)", async () => {
+    const kill = () => { }; // probe succeeds: group alive
+    const receipt = await operatorStopReceipt({
+      aborted: true, processGroupId: 9, kill, pollMs: 1, verifyMs: 8,
+    });
+    assert.equal(receipt, null);
+  });
+
+  it("probe errors other than ESRCH count as alive → no receipt", async () => {
+    const kill = (pgid, sig) => {
+      if (sig === 0) {
+        const err = new Error("operation not permitted");
+        err.code = "EPERM";
+        throw err;
+      }
+    };
+    const receipt = await operatorStopReceipt({
+      aborted: true, processGroupId: 5, kill, pollMs: 1, verifyMs: 5,
+    });
+    assert.equal(receipt, null);
+  });
+
+  it("aborted with no adopted group → acknowledged/forced:false (nothing spawned)", async () => {
+    const receipt = await operatorStopReceipt({ aborted: true, processGroupId: null, kill: () => { } });
+    assert.equal(receipt.state, "acknowledged");
+    assert.equal(receipt.forced, false);
+  });
+
+  it("not aborted → null", async () => {
+    assert.equal(await operatorStopReceipt({ aborted: false, processGroupId: 1, kill: () => esrch() }), null);
+    assert.equal(await operatorStopReceipt({}), null);
+  });
+});
+
+describe("protectExecute stop-receipt wiring (MYL-60)", () => {
+  const esrch = () => {
+    const err = new Error("kill failed: no such process");
+    err.code = "ESRCH";
+    throw err;
+  };
+
+  it("an aborted run with a verified-dead group returns executionCancellation acknowledged", async () => {
+    const controller = new AbortController();
+    const kills = [];
+    const kill = (pgid, sig) => {
+      kills.push([pgid, sig]);
+      if (sig === 0) esrch();
+    };
+    const fakeExecute = async (ctx) => {
+      await ctx.onSpawn({ pid: 4242, processGroupId: 4242 });
+      controller.abort();
+      return { exitCode: 143, resultJson: { subtype: "success", is_error: false, costUsd: 0.5 } };
+    };
+    const wrapped = protectExecute(fakeExecute, (r) => r, { kill, pollMs: 1, verifyMs: 50 });
+    const result = await wrapped({ onLog: () => { }, signal: controller.signal });
+    assert.equal(result.resultJson.executionCancellation.state, "acknowledged");
+    assert.equal(result.resultJson.executionCancellation.forced, true);
+    assert.ok(!Number.isNaN(Date.parse(result.resultJson.executionCancellation.acknowledgedAt)));
+    assert.equal(result.resultJson.subtype, "success"); // CLI result fields survive the merge
+    assert.equal(result.resultJson.costUsd, 0.5);
+    assert.ok(kills.some(([pgid, sig]) => pgid === 4242 && sig === "SIGTERM"));
+    assert.ok(kills.some(([pgid, sig]) => pgid === 4242 && sig === 0));
+  });
+
+  it("an aborted run whose group survives keeps the honest no-receipt result", async () => {
+    const controller = new AbortController();
+    const killsRecorded = [];
+    const kill = (pgid, sig) => { if (sig !== 0) killsRecorded.push([pgid, sig]); };
+    const fakeExecute = async (ctx) => {
+      await ctx.onSpawn({ pid: 8484, processGroupId: 8484 });
+      controller.abort();
+      return { exitCode: 143, resultJson: { subtype: "error_max_turns" } };
+    };
+    const wrapped = protectExecute(fakeExecute, (r) => r, { kill, pollMs: 1, verifyMs: 10 });
+    const result = await wrapped({ onLog: () => { }, signal: controller.signal });
+    assert.equal(result.resultJson.executionCancellation, undefined);
+    assert.equal(result.resultJson.subtype, "error_max_turns");
+    assert.deepEqual(killsRecorded, [[8484, "SIGTERM"]]); // cancel still ran
+  });
+
+  it("an aborted run that never spawned gets acknowledged/forced:false", async () => {
+    const controller = new AbortController();
+    const fakeExecute = async () => {
+      controller.abort();
+      return { exitCode: 0, resultJson: {} };
+    };
+    const wrapped = protectExecute(fakeExecute, (r) => r, { kill: () => { }, pollMs: 1, verifyMs: 5 });
+    const result = await wrapped({ onLog: () => { }, signal: controller.signal });
+    assert.equal(result.resultJson.executionCancellation.state, "acknowledged");
+    assert.equal(result.resultJson.executionCancellation.forced, false);
+  });
+
+  it("a non-aborted run result is untouched", async () => {
+    const fakeExecute = async () => ({ exitCode: 0, resultJson: { subtype: "success" } });
+    const wrapped = protectExecute(fakeExecute, (r) => r, { kill: () => esrch(), pollMs: 1, verifyMs: 5 });
+    const result = await wrapped({ onLog: () => { } });
+    assert.deepEqual(result, { exitCode: 0, resultJson: { subtype: "success" } });
+  });
+
+  it("a null adapter result stays null (the receipt path never throws)", async () => {
+    const controller = new AbortController();
+    const fakeExecute = async () => { controller.abort(); return null; };
+    const wrapped = protectExecute(fakeExecute, (r) => r, { kill: () => esrch(), pollMs: 1, verifyMs: 5 });
+    const result = await wrapped({ onLog: () => { }, signal: controller.signal });
+    assert.equal(result, null);
+  });
+
+  it("a throwing kill probe never breaks the returned result", async () => {
+    const controller = new AbortController();
+    const fakeExecute = async (ctx) => {
+      await ctx.onSpawn({ pid: 99, processGroupId: 99 });
+      controller.abort();
+      return { exitCode: 143, resultJson: { subtype: "success", is_error: false } };
+    };
+    const wrapped = protectExecute(fakeExecute, (r) => r, {
+      kill: () => { throw new Error("probe exploded"); },
+      pollMs: 1,
+      verifyMs: 5,
+    });
+    const result = await wrapped({ onLog: () => { }, signal: controller.signal });
+    assert.equal(result.resultJson.subtype, "success");
+    assert.equal(result.resultJson.executionCancellation, undefined);
   });
 });

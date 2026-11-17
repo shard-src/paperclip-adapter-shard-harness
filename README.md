@@ -59,6 +59,33 @@ Three wrapper-level guards around the vendored upstream `claudeExecute`
 All guards are best-effort: any internal failure disables the guard without
 affecting the run.
 
+## Operator-stop receipt (v1.5.0, MYL-60)
+
+Board-Cancel of an active legacy run used to answer
+`409 Execution ended, but provider termination could not be verified` even
+though the cancel succeeded (process group dead, run cancelled, queue free).
+Cause: the server writes the `executionCancellation: acknowledged` stamp only
+for processes it spawned itself (`runningProcesses`), and its cancel answer
+conflicts when the terminal run row lacks the stamp — deterministic for
+adapter-spawned legacy runs, which settle after the terminal write.
+
+The fix uses the platform's own receipt contract (established by
+`adapter-utils`' acpx-engine): after the CLI settles, the wrapper merges
+`resultJson.executionCancellation = { state: "acknowledged", acknowledgedAt,
+forced }` into the returned result, and the server's terminal write carries it
+into the run row, so the cancel answer verifies provider termination and
+returns success.
+
+The stamp is only claimed with proof, mirroring the server's
+`completedRunTerminationProof` standard:
+
+- aborted with an adopted process group → `kill(-pgid, 0)` must report ESRCH
+  (polled for up to `SHARD_HARNESS_STOP_RECEIPT_VERIFY_MS`); `forced: true`;
+- aborted before anything spawned → `forced: false` (nothing to terminate,
+  like acpx's "Stopped before provider startup");
+- group still alive, probe inconclusive, or nothing aborted → **no stamp**:
+  the honest server conflict answer remains.
+
 ### Environment overrides
 
 | Variable | Default | Meaning |
@@ -66,6 +93,7 @@ affecting the run.
 | `SHARD_HARNESS_CANCEL_GRACE_MS` | `10000` | SIGTERM → SIGKILL grace on cancel |
 | `SHARD_HARNESS_PROGRESS_INTERVAL_MS` | `5000` | progress throttle (floor 5 s) |
 | `SHARD_HARNESS_THINKING_WINDOW_MS` | `15000` | thinking_tokens tap window |
+| `SHARD_HARNESS_STOP_RECEIPT_VERIFY_MS` | `2000` | stop-receipt ESRCH verification window |
 
 ## Requirements
 
