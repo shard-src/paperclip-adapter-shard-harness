@@ -72,10 +72,13 @@ function progressIntervalMs() {
 
 // README-documented env override for the operator-stop receipt verification
 // window: how long the wrapper polls the adopted process group for ESRCH
-// before giving up (and leaving the honest 409 in place).
-function stopReceiptVerifyMs() {
+// before giving up (and leaving the honest 409 in place). Default covers the
+// guard's own SIGKILL escalation (grace + 2 s): group members that ignore
+// SIGTERM must still die within the window for the receipt to be honest.
+function stopReceiptVerifyMs(graceMs = cancelGraceMs()) {
   const raw = Number(process.env.SHARD_HARNESS_STOP_RECEIPT_VERIFY_MS);
-  return Number.isFinite(raw) && raw >= 0 ? raw : STOP_RECEIPT_VERIFY_MS_DEFAULT;
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return Math.max(graceMs + 2_000, STOP_RECEIPT_VERIFY_MS_DEFAULT);
 }
 
 // ── thinking_tokens tap ───────────────────────────────────────────────────────
@@ -466,38 +469,46 @@ export function protectExecute(claudeExecute, repair, deps = {}) {
     } catch { /* cancel-readiness is best-effort */ }
 
     let result;
+    // guard.dispose() deliberately runs AFTER the stop receipt: the pending
+    // SIGKILL escalation is what guarantees group members that ignored SIGTERM
+    // die inside the receipt's verification window. Disposing first (the
+    // pre-1.5.0 order) cancelled the escalation and left the group half-alive,
+    // so the receipt could not verify termination and the honest 409 remained.
     try {
-      result = await claudeExecute(wrappedCtx);
+      try {
+        result = await claudeExecute(wrappedCtx);
+      } finally {
+        reporter?.dispose();
+        tap.dispose();
+      }
+      result = repair(result);
+
+      // MYL-60: attach the adapter-verified stop receipt. The receipt only
+      // claims what this wrapper proved: no process was spawned, or the adopted
+      // group is gone per the OS. Best-effort like every guard here — a
+      // receipt failure never affects the returned run result.
+      try {
+        const receipt = await operatorStopReceipt({
+          aborted: ctx.signal?.aborted === true,
+          processGroupId: guard.adoptedGroup(),
+          kill,
+          pollMs: deps.pollMs,
+          verifyMs: deps.verifyMs ?? stopReceiptVerifyMs(),
+        });
+        if (receipt && result && typeof result === "object"
+          && (result.resultJson == null || typeof result.resultJson === "object")) {
+          result = {
+            ...result,
+            resultJson: { ...result.resultJson, executionCancellation: receipt },
+          };
+          guard.note(`operator stop receipt: ${receipt.state} (${receipt.forced
+            ? `process group ${guard.adoptedGroup()} exit verified`
+            : "no process spawned"})`);
+        }
+      } catch { /* the receipt is best-effort */ }
+      return result;
     } finally {
       guard.dispose();
-      reporter?.dispose();
-      tap.dispose();
     }
-    result = repair(result);
-
-    // MYL-60: attach the adapter-verified stop receipt. The receipt only
-    // claims what this wrapper proved: no process was spawned, or the adopted
-    // group is gone per the OS. Best-effort like every guard here — a receipt
-    // failure never affects the returned run result.
-    try {
-      const receipt = await operatorStopReceipt({
-        aborted: ctx.signal?.aborted === true,
-        processGroupId: guard.adoptedGroup(),
-        kill,
-        pollMs: deps.pollMs,
-        verifyMs: deps.verifyMs ?? stopReceiptVerifyMs(),
-      });
-      if (receipt && result && typeof result === "object"
-        && (result.resultJson == null || typeof result.resultJson === "object")) {
-        result = {
-          ...result,
-          resultJson: { ...result.resultJson, executionCancellation: receipt },
-        };
-        guard.note(`operator stop receipt: ${receipt.state} (${receipt.forced
-          ? `process group ${guard.adoptedGroup()} exit verified`
-          : "no process spawned"})`);
-      }
-    } catch { /* the receipt is best-effort */ }
-    return result;
   };
 }
